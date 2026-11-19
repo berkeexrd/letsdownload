@@ -1,0 +1,33 @@
+[package]
+name = "letsdownload"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+bytes = "1.12.2"
+eframe = "0.37.0"
+futures-util = "0.3.34"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["client", "http1"] }
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "tls12", "ring", "native-tokio"] }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "tokio", "http1"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+netdev = "0.47.0"
+percent-encoding = "2.3.2"
+rfd = "0.18.0"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+socket2 = "0.6.5"
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-util = "0.7.20"
+tower-service = "0.3.3"
+url = "2.5.8"
+windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
