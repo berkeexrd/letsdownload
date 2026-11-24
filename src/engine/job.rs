@@ -40,6 +40,7 @@ pub struct DoneRange {
 pub struct LinkFail {
     pub consecutive: u32,
     pub dead: bool,
+    pub dead_at: Option<std::time::Instant>,
     pub msg: Option<String>,
 }
 

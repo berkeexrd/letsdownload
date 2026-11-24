@@ -10,9 +10,27 @@ pub struct Found {
 
 fn looks_virtual(s: &str) -> bool {
     let s = s.to_lowercase();
+    if s.contains("virtualbox")
+        || s.contains("vmware")
+        || s.contains("vethernet")
+        || s.contains("hyper-v")
+    {
+        return true;
+    }
     [
-        "vmware", "virtualbox", "vethernet", "hyper-v", "virtual", "vpn", "tap-", "tun", "wsl",
-        "docker", "loopback", "bluetooth", "wintun", "npcap", "tailscale", "zerotier",
+        "vpn", "tap-", "tun", "wsl", "docker", "loopback", "bluetooth", "wintun", "npcap",
+        "tailscale", "zerotier", "virtual adapter", "virtual network", "virtual ethernet",
+        "miniport",
+    ]
+    .iter()
+    .any(|p| s.contains(p))
+}
+
+fn looks_mobile_or_vpn(s: &str) -> bool {
+    let s = s.to_lowercase();
+    [
+        "rndis", "ndis", "usb", "tether", "mobile", "cellular", "wwan", " 5g", " 4g",
+        "iphone", "android", "wireguard", "tun", "tap-", "wintun", "ppp", "wan miniport",
     ]
     .iter()
     .any(|p| s.contains(p))
@@ -23,6 +41,10 @@ fn usable(ip: &Ipv4Addr) -> bool {
 }
 
 pub fn discover() -> Vec<Found> {
+    let default_index = netdev::get_default_interface().ok().map(|i| i.index);
+    let default_gw = netdev::get_default_gateway()
+        .ok()
+        .and_then(|g| g.ipv4.first().copied());
     let mut out = Vec::new();
     for itf in netdev::get_interfaces() {
         if itf.is_loopback() {
@@ -35,8 +57,14 @@ pub fn discover() -> Vec<Found> {
             Some(ip) => ip,
             None => continue,
         };
-        let gateway = itf.gateway.as_ref().and_then(|g| g.ipv4.first().copied());
+        let is_default = default_index == Some(itf.index);
+        let gateway = itf
+            .gateway
+            .as_ref()
+            .and_then(|g| g.ipv4.first().copied())
+            .or_else(|| if is_default { default_gw } else { None });
         let virt = looks_virtual(&name) || looks_virtual(&desc);
+        let mobile_or_vpn = looks_mobile_or_vpn(&name) || looks_mobile_or_vpn(&desc);
         let kind = if virt {
             LinkKind::Virtual
         } else {
@@ -50,6 +78,8 @@ pub fn discover() -> Vec<Found> {
                 _ => LinkKind::Other,
             }
         };
+        let up = itf.is_up() || itf.is_running() || is_default || gateway.is_some();
+        let has_route = gateway.is_some() || is_default || (!virt && up) || (mobile_or_vpn && up);
         out.push(Found {
             key: itf.name.clone(),
             name,
@@ -59,9 +89,40 @@ pub fn discover() -> Vec<Found> {
                 gateway,
                 kind,
                 description: desc,
-                present: itf.is_up() && gateway.is_some(),
+                present: up && has_route,
             },
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virtual_detection_distinguishes_real_and_virtual_adapters() {
+        assert!(looks_virtual("VMware Network Adapter VMnet1"));
+        assert!(looks_virtual("vEthernet (Default Switch)"));
+        assert!(looks_virtual("Tailscale Tunnel"));
+        assert!(!looks_virtual("Realtek PCIe GbE Family Controller"));
+        assert!(!looks_virtual("Intel(R) Wi-Fi 6 AX200 160MHz"));
+    }
+
+    #[test]
+    fn usable_ipv4_filters_non_routable_addresses() {
+        assert!(!usable(&Ipv4Addr::LOCALHOST));
+        assert!(!usable(&Ipv4Addr::UNSPECIFIED));
+        assert!(!usable(&Ipv4Addr::new(169, 254, 1, 5)));
+        assert!(usable(&Ipv4Addr::new(192, 168, 1, 15)));
+        assert!(usable(&Ipv4Addr::new(10, 0, 0, 2)));
+    }
+
+    #[test]
+    fn mobile_or_vpn_detection_recognizes_tethering_and_tunnels() {
+        assert!(looks_mobile_or_vpn("Remote NDIS based Internet Sharing Device"));
+        assert!(looks_mobile_or_vpn("Apple Mobile Device Ethernet"));
+        assert!(looks_mobile_or_vpn("WireGuard Tunnel"));
+        assert!(!looks_mobile_or_vpn("Realtek PCIe GbE Family Controller"));
+    }
 }

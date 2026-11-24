@@ -58,6 +58,8 @@ pub struct LinkView {
     pub key: String,
     pub slot: usize,
     pub name: String,
+    pub ip: Ipv4Addr,
+    pub gateway: Option<Ipv4Addr>,
     pub kind: LinkKind,
     pub desc: String,
     pub present: bool,
@@ -201,7 +203,6 @@ impl Engine {
                 }
                 *l.name.write().unwrap() = f.name.clone();
             } else {
-
                 let slot = if f.net.kind == LinkKind::Virtual {
                     links.iter().map(|l| l.slot + 1).filter(|s| *s >= 100).max().unwrap_or(100)
                 } else {
@@ -209,7 +210,7 @@ impl Engine {
                 };
                 let l = Link::new(f.key.clone(), slot, f.name.clone(), f.net.clone());
                 l.enabled.store(
-                    f.net.present && f.net.kind != LinkKind::Virtual && crate::dev::link_allowed(&f.key),
+                    f.net.kind != LinkKind::Virtual && crate::dev::link_allowed(&f.key),
                     Ordering::Relaxed,
                 );
                 links.push(Arc::new(l));
@@ -220,6 +221,52 @@ impl Engine {
             if !found.iter().any(|f| f.key == l.key) && l.is_present() {
                 l.net.write().unwrap().present = false;
                 changed = true;
+            }
+        }
+        let any_active = links.iter().any(|l| l.is_present() && l.is_enabled());
+        if !any_active {
+            for l in links.iter() {
+                if l.is_present() && l.net().kind != LinkKind::Virtual && crate::dev::link_allowed(&l.key) {
+                    l.enabled.store(true, Ordering::Relaxed);
+                    changed = true;
+                }
+            }
+        }
+        let any_active = links.iter().any(|l| l.is_present() && l.is_enabled());
+        if !any_active && !crate::dev::fake_mode() {
+            if let Some(l) = links.iter().find(|l| l.is_present() && crate::dev::link_allowed(&l.key)) {
+                l.enabled.store(true, Ordering::Relaxed);
+                changed = true;
+            } else if let Some(l) = links.iter().find(|l| l.key == "system-default") {
+                if !l.is_present() || !l.is_enabled() {
+                    l.net.write().unwrap().present = true;
+                    l.enabled.store(true, Ordering::Relaxed);
+                    changed = true;
+                }
+            } else {
+                let slot = links.iter().map(|l| l.slot + 1).filter(|s| *s < 100).max().unwrap_or(0);
+                let l = Link::new(
+                    "system-default".into(),
+                    slot,
+                    "Sistem Ağ Bağlantısı".into(),
+                    NetInfo {
+                        ip: Ipv4Addr::UNSPECIFIED,
+                        if_index: 0,
+                        gateway: None,
+                        kind: LinkKind::Other,
+                        description: "Varsayılan sistem bağlantısı".into(),
+                        present: true,
+                    },
+                );
+                links.push(Arc::new(l));
+                changed = true;
+            }
+        } else if found.iter().any(|f| f.net.present) {
+            if let Some(l) = links.iter().find(|l| l.key == "system-default") {
+                if l.is_present() {
+                    l.net.write().unwrap().present = false;
+                    changed = true;
+                }
             }
         }
         if changed {
@@ -392,6 +439,8 @@ impl Engine {
                     key: l.key.clone(),
                     slot: l.slot,
                     name: l.name(),
+                    ip: net.ip,
+                    gateway: net.gateway,
                     kind: net.kind,
                     desc: net.description.clone(),
                     present: net.present,
@@ -522,7 +571,7 @@ impl Engine {
                     used: l.used(),
                     speed_cap: l.speed_cap.load(Ordering::Relaxed),
                 })
-                .filter(|c| !crate::dev::is_fake(&c.key))
+                .filter(|c| !crate::dev::is_fake(&c.key) && c.key != "system-default")
                 .collect(),
         };
         let files: Vec<JobFile> = self
@@ -597,6 +646,21 @@ impl Engine {
 
             let conns = self.settings.lock().unwrap().conns_per_link.clamp(1, 16);
             let links: Vec<Arc<Link>> = self.links.read().unwrap().clone();
+            let active_link_count = links
+                .iter()
+                .filter(|l| l.is_enabled() && l.is_present())
+                .count();
+            let allow_fallback = active_link_count <= 1;
+            {
+                let mut g = job.inner.lock().unwrap();
+                for f in g.fails.values_mut() {
+                    if f.dead && f.dead_at.is_some_and(|t| t.elapsed() >= Duration::from_secs(12)) {
+                        f.dead = false;
+                        f.dead_at = None;
+                        f.consecutive = 0;
+                    }
+                }
+            }
             let mut total_workers: u32 = running.values().sum();
             for l in &links {
                 if !(l.is_enabled() && l.is_present()) {
@@ -618,12 +682,13 @@ impl Engine {
                     set.spawn(async move {
                         let key = lk.key.clone();
                         let failed_job = j.clone();
-                        match AssertUnwindSafe(e.worker(j, lk, tk, p)).catch_unwind().await {
+                        match AssertUnwindSafe(e.worker(j, lk, tk, p, allow_fallback)).catch_unwind().await {
                             Ok(k) => k,
                             Err(_) => {
                                 let mut g = failed_job.inner.lock().unwrap_or_else(|e| e.into_inner());
                                 let f = g.fails.entry(key.clone()).or_default();
                                 f.dead = true;
+                                f.dead_at = Some(Instant::now());
                                 f.msg = Some("iç hata".into());
                                 key
                             }
@@ -735,12 +800,47 @@ impl Engine {
     }
 
     async fn probe(&self, job: &Arc<Job>) -> Result<()> {
+        self.refresh_links();
         let url = job.inner.lock().unwrap().url.clone();
         let links: Vec<Arc<Link>> = self.links.read().unwrap().clone();
         let mut last: anyhow::Error = anyhow::anyhow!("Kullanılabilir internet bağlantısı yok");
-        for l in links.iter().filter(|l| l.is_enabled() && l.is_present()) {
-            let client = make_client(l.clone());
-            match http::get(&client, &url, Some((0, 0)), None).await {
+        let mut candidates: Vec<Arc<Link>> = links
+            .iter()
+            .filter(|l| l.is_enabled() && l.is_present())
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            candidates = links.iter().filter(|l| l.is_present()).cloned().collect();
+        }
+        if candidates.is_empty() && !crate::dev::fake_mode() {
+            candidates.push(Arc::new(Link::new(
+                "system-default".into(),
+                0,
+                "Sistem Ağ Bağlantısı".into(),
+                NetInfo {
+                    ip: Ipv4Addr::UNSPECIFIED,
+                    if_index: 0,
+                    gateway: None,
+                    kind: LinkKind::Other,
+                    description: "Varsayılan sistem bağlantısı".into(),
+                    present: true,
+                },
+            )));
+        }
+        let allow_fallback = candidates.len() <= 1;
+        for l in &candidates {
+            let client = make_client(l.clone(), allow_fallback || l.key == "system-default");
+            let mut attempt = http::get(&client, &url, Some((0, 0)), None).await;
+            if let Ok(ref f) = attempt {
+                let st = f.resp.status().as_u16();
+                if matches!(st, 400 | 405 | 416 | 501) {
+                    attempt = match http::head(&client, &url).await {
+                        Ok(hf) if hf.resp.status().is_success() => Ok(hf),
+                        _ => http::get(&client, &url, None, None).await,
+                    };
+                }
+            }
+            match attempt {
                 Ok(f) => {
                     let status = f.resp.status();
                     let h = f.resp.headers();
@@ -763,7 +863,7 @@ impl Engine {
                         (clen, accept && clen.is_some())
                     } else {
                         last = anyhow::anyhow!("Sunucu HTTP {} döndürdü", status.as_u16());
-                        if status.is_client_error() {
+                        if status.is_client_error() && !matches!(status.as_u16(), 403 | 429) {
                             return Err(last);
                         }
                         continue;
@@ -785,6 +885,10 @@ impl Engine {
                     let final_url = f.final_url.clone();
                     drop(f);
 
+                    if !l.is_enabled() {
+                        l.enabled.store(true, Ordering::Relaxed);
+                        self.dirty.store(true, Ordering::Relaxed);
+                    }
                     let mut g = job.inner.lock().unwrap();
                     let name = match cd_name {
                         Some(n) => sanitize(&n),
@@ -826,6 +930,7 @@ impl Engine {
         link: Arc<Link>,
         token: CancellationToken,
         part: PathBuf,
+        allow_fallback: bool,
     ) -> String {
         let key = link.key.clone();
         let slot = link.slot as u8;
@@ -837,7 +942,7 @@ impl Engine {
                 return key;
             }
         };
-        let client = make_client(link.clone());
+        let client = make_client(link.clone(), allow_fallback || key == "system-default");
         let mut backoff = 500u64;
         loop {
             if token.is_cancelled() {
@@ -862,6 +967,7 @@ impl Engine {
                         let mut g = job.inner.lock().unwrap();
                         let f = g.fails.entry(key.clone()).or_default();
                         f.dead = true;
+                        f.dead_at = None;
                         f.msg = Some("Kota bu dosya için yeterli değil".into());
                         break;
                     }
@@ -879,6 +985,8 @@ impl Engine {
                             backoff = 500;
                             if let Some(f) = job.inner.lock().unwrap().fails.get_mut(&key) {
                                 f.consecutive = 0;
+                                f.dead = false;
+                                f.dead_at = None;
                             }
                         }
                         Err(ChunkErr::Cancelled) => break,
@@ -891,6 +999,7 @@ impl Engine {
                             let mut g = job.inner.lock().unwrap();
                             let f = g.fails.entry(key.clone()).or_default();
                             f.dead = true;
+                            f.dead_at = None;
                             f.msg = Some(m);
                             break;
                         }
@@ -906,6 +1015,7 @@ impl Engine {
                                 f.msg = Some(m);
                                 if f.consecutive >= 8 {
                                     f.dead = true;
+                                    f.dead_at = Some(Instant::now());
                                 }
                                 f.dead
                             };
@@ -936,17 +1046,28 @@ impl Engine {
         end: u64,
         got: &mut u64,
     ) -> Result<(), ChunkErr> {
-        let (url, validator, ranges) = {
+        let (url, orig_url, validator, ranges) = {
             let g = job.inner.lock().unwrap();
-            (g.final_url.clone(), g.validator.clone(), g.ranges)
+            (g.final_url.clone(), g.url.clone(), g.validator.clone(), g.ranges)
         };
         let range = if ranges { Some((start, end - 1)) } else { None };
-        let fetched = tokio::select! {
+        let mut fetched = tokio::select! {
             _ = token.cancelled() => return Err(ChunkErr::Cancelled),
             r = http::get(client, &url, range, validator.as_deref()) => {
                 r.map_err(|e| ChunkErr::Retry(e.to_string()))?
             }
         };
+        if matches!(fetched.resp.status().as_u16(), 401 | 403 | 410) && url != orig_url {
+            if let Ok(re) = tokio::select! {
+                _ = token.cancelled() => return Err(ChunkErr::Cancelled),
+                r = http::get(client, &orig_url, range, validator.as_deref()) => r,
+            } {
+                if re.resp.status().is_success() || re.resp.status().as_u16() == 206 {
+                    job.inner.lock().unwrap().final_url = re.final_url.clone();
+                }
+                fetched = re;
+            }
+        }
         let status = fetched.resp.status().as_u16();
         let ok = if ranges { status == 206 } else { status == 200 };
         if !ok {

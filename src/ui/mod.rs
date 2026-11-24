@@ -386,6 +386,9 @@ impl App {
         text_vc(&p, pos2(nb.left() + 52.0, nb.center().y), "Yeni İndirme", bold(15.0), TEXT);
         if resp.clicked() {
             self.new_dialog = true;
+            if self.input.trim().is_empty() {
+                ui.ctx().send_viewport_cmd(ViewportCommand::RequestPaste);
+            }
         }
 
         let acts = [
@@ -630,7 +633,14 @@ fn kind_label(k: LinkKind) -> &'static str {
 impl App {
     fn links_panel(&mut self, ui: &mut egui::Ui, view: &View, cur: Option<&JobView>) {
         let w = ui.available_width();
-        let links: Vec<&LinkView> = view.links.iter().filter(|l| self.show_virtual || l.kind != LinkKind::Virtual || l.enabled).collect();
+        let links: Vec<&LinkView> = view
+            .links
+            .iter()
+            .filter(|l| {
+                (l.key != "system-default" || l.present)
+                    && (self.show_virtual || l.kind != LinkKind::Virtual || l.enabled)
+            })
+            .collect();
         let row_h = 60.0;
         let rows = links.len().max(1) as f32;
         let h = 62.0 + 78.0 + 12.0 + rows * row_h + 14.0;
@@ -641,6 +651,17 @@ impl App {
         draw_icon(&p, pos2(rect.left() + 34.0, rect.top() + 32.0), 24.0, Icon::Network, ACCENT2);
         let r = text_vc(&p, pos2(rect.left() + 56.0, rect.top() + 32.0), "Bağlantılar", bold(19.0), TEXT);
         text_vc(&p, pos2(r.right() + 8.0, rect.top() + 33.0), "(Çoklu Ağ)", regular(15.0), MUTED);
+
+        let rbtn = Rect::from_min_size(pos2(rect.right() - 124.0, rect.top() + 16.0), vec2(104.0, 32.0));
+        let rresp = ui.interact(rbtn, Id::new("btn-refresh-links"), Sense::click());
+        p.rect_filled(rbtn, 9.0, if rresp.hovered() { Color32::from_rgb(40, 36, 66) } else { CARD2 });
+        p.rect_stroke(rbtn, 9.0, Stroke::new(1.0, alpha(Color32::WHITE, 16)), StrokeKind::Inside);
+        draw_icon(&p, pos2(rbtn.left() + 18.0, rbtn.center().y), 16.0, Icon::Network, ACCENT2);
+        text_vc(&p, pos2(rbtn.left() + 34.0, rbtn.center().y), "Yenile", bold(13.0), TEXT);
+        if rresp.on_hover_text("Ağ adaptörlerini yeniden tara").clicked() {
+            self.eng.refresh_links();
+            self.toast = Some(("Ağ bağlantıları yenilendi".into(), Instant::now()));
+        }
 
         let inner = Rect::from_min_max(rect.left_top() + vec2(20.0, 62.0), rect.right_bottom() - vec2(20.0, 0.0));
         let gap = 12.0;
@@ -699,7 +720,19 @@ impl App {
             let name_w = rr.width() * cols[0] - 120.0;
             let g = ellipsize(&p, &l.name, bold(16.0), TEXT, name_w.max(50.0));
             p.galley(pos2(rr.left() + 108.0, cy - 11.0 - g.size().y / 2.0), g, TEXT);
-            let desc = if l.desc.is_empty() || l.desc == "test" { kind_label(l.kind).to_string() } else { l.desc.clone() };
+            let base_desc = if l.desc.is_empty() || l.desc == "test" {
+                kind_label(l.kind).to_string()
+            } else {
+                l.desc.clone()
+            };
+            let desc = if !l.ip.is_unspecified() {
+                match l.gateway {
+                    Some(gw) => format!("{}  •  {} (GW: {})", l.ip, base_desc, gw),
+                    None => format!("{}  •  {}", l.ip, base_desc),
+                }
+            } else {
+                base_desc
+            };
             let g = ellipsize(&p, &desc, regular(12.5), MUTED, name_w.max(50.0));
             p.galley(pos2(rr.left() + 108.0, cy + 11.0 - g.size().y / 2.0), g, MUTED);
 
@@ -933,6 +966,19 @@ impl App {
                     if self.input.is_empty() && !resp.has_focus() {
                         resp.request_focus();
                     }
+                    if self.input.is_empty() {
+                        let pasted = ui.input(|i| {
+                            i.events.iter().find_map(|ev| match ev {
+                                egui::Event::Paste(s) => Some(s.trim().to_string()),
+                                _ => None,
+                            })
+                        });
+                        if let Some(p) = pasted {
+                            if p.starts_with("http://") || p.starts_with("https://") {
+                                self.input = p;
+                            }
+                        }
+                    }
                     if resp.has_focus() && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter)) {
                         submit = true;
                     }
@@ -943,6 +989,13 @@ impl App {
                         ui.painter().text(r.center(), Align2::CENTER_CENTER, "İndir", bold(15.0), Color32::WHITE);
                         if resp.clicked() {
                             submit = true;
+                        }
+                        let (pr, presp) = ui.allocate_exact_size(vec2(130.0, 40.0), Sense::click());
+                        ui.painter().rect_filled(pr, 11.0, if presp.hovered() { Color32::from_rgb(42, 38, 70) } else { CARD2 });
+                        ui.painter().text(pr.center(), Align2::CENTER_CENTER, "Panodan Yapıştır", regular(14.0), TEXT);
+                        if presp.clicked() {
+                            resp.request_focus();
+                            ui.ctx().send_viewport_cmd(ViewportCommand::RequestPaste);
                         }
                     });
                 });

@@ -21,6 +21,7 @@ pub type HttpClient = Client<HttpsConnector<BoundConnector>, Empty<Bytes>>;
 #[derive(Clone)]
 pub struct BoundConnector {
     link: Arc<Link>,
+    allow_system_fallback: bool,
 }
 
 impl tower_service::Service<Uri> for BoundConnector {
@@ -34,6 +35,7 @@ impl tower_service::Service<Uri> for BoundConnector {
 
     fn call(&mut self, dst: Uri) -> Self::Future {
         let link = self.link.clone();
+        let allow_system_fallback = self.allow_system_fallback;
         Box::pin(async move {
             let host = dst
                 .host()
@@ -45,19 +47,24 @@ impl tower_service::Service<Uri> for BoundConnector {
                 .port_u16()
                 .unwrap_or(if dst.scheme_str() == Some("https") { 443 } else { 80 });
 
-            let addrs: Vec<SocketAddr> = lookup_host((host.as_str(), port))
-                .await?
-                .filter(|a| a.is_ipv4())
-                .collect();
-            if addrs.is_empty() {
+            let addrs: Vec<SocketAddr> = lookup_host((host.as_str(), port)).await?.collect();
+            let v4: Vec<SocketAddr> = addrs.iter().copied().filter(|a| a.is_ipv4()).collect();
+            let candidates = if !v4.is_empty() {
+                v4
+            } else if allow_system_fallback {
+                addrs
+            } else {
+                Vec::new()
+            };
+            if candidates.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    "no IPv4 address for host",
+                    "sunucu için uygun IP adresi bulunamadı",
                 ));
             }
-            let mut last = io::Error::other("connect failed");
-            for addr in addrs.into_iter().take(3) {
-                match connect_bound(&link, addr).await {
+            let mut last = io::Error::other("bağlantı kurulamadı");
+            for addr in candidates.into_iter().take(4) {
+                match connect_bound(&link, addr, allow_system_fallback).await {
                     Ok(s) => return Ok(TokioIo::new(s)),
                     Err(e) => last = e,
                 }
@@ -67,20 +74,59 @@ impl tower_service::Service<Uri> for BoundConnector {
     }
 }
 
-async fn connect_bound(link: &Link, addr: SocketAddr) -> io::Result<TcpStream> {
+async fn connect_bound(
+    link: &Link,
+    addr: SocketAddr,
+    allow_system_fallback: bool,
+) -> io::Result<TcpStream> {
     let net = link.net();
+    if addr.is_ipv4() && !net.ip.is_unspecified() {
+        match try_connect_bound_v4(&net, addr).await {
+            Ok(s) => return Ok(s),
+            Err(e) if !allow_system_fallback => return Err(e),
+            Err(_) => {}
+        }
+    } else if !allow_system_fallback && !net.ip.is_unspecified() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "adaptör IPv4 bağlantısı gerektiriyor",
+        ));
+    }
+    let s = tokio::time::timeout(Duration::from_secs(12), TcpStream::connect(addr))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "bağlantı zaman aşımı"))??;
+    let _ = s.set_nodelay(true);
+    Ok(s)
+}
+
+async fn try_connect_bound_v4(net: &super::link::NetInfo, addr: SocketAddr) -> io::Result<TcpStream> {
+    if net.if_index != 0 {
+        if let Ok(s) = try_connect_v4_once(net.ip, Some(net.if_index), addr).await {
+            return Ok(s);
+        }
+    }
+    try_connect_v4_once(net.ip, None, addr).await
+}
+
+async fn try_connect_v4_once(
+    local_ip: std::net::Ipv4Addr,
+    if_index: Option<u32>,
+    addr: SocketAddr,
+) -> io::Result<TcpStream> {
     let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
     sock.set_nonblocking(true)?;
     let _ = sock.set_tcp_nodelay(true);
     #[cfg(windows)]
-    if net.if_index != 0 {
-        set_unicast_if(&sock, net.if_index)?;
+    if let Some(idx) = if_index {
+        set_unicast_if(&sock, idx)?;
     }
-    sock.bind(&SocketAddr::new(IpAddr::V4(net.ip), 0).into())?;
+    #[cfg(not(windows))]
+    let _ = if_index;
+    sock.bind(&SocketAddr::new(IpAddr::V4(local_ip), 0).into())?;
     let sock = TcpSocket::from_std_stream(sock.into());
     tokio::time::timeout(Duration::from_secs(12), sock.connect(addr))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))?
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "bağlantı zaman aşımı"))?
 }
 
 #[cfg(windows)]
@@ -121,19 +167,22 @@ fn tls_config() -> ClientConfig {
     .clone()
 }
 
-pub fn make_client(link: Arc<Link>) -> HttpClient {
+pub fn make_client(link: Arc<Link>, allow_system_fallback: bool) -> HttpClient {
     let https = HttpsConnectorBuilder::new()
         .with_tls_config(tls_config())
         .https_or_http()
         .enable_http1()
-        .wrap_connector(BoundConnector { link });
+        .wrap_connector(BoundConnector { link, allow_system_fallback });
     Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(1)
+        .pool_max_idle_per_host(2)
         .pool_idle_timeout(Duration::from_secs(20))
         .build(https)
 }
 
-const UA: &str = concat!("Mozilla/5.0 (Windows NT 10.0; Win64; x64) LetsDownload/", env!("CARGO_PKG_VERSION"));
+const UA: &str = concat!(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 LetsDownload/",
+    env!("CARGO_PKG_VERSION")
+);
 
 pub struct Fetched {
     pub resp: Response<Incoming>,
@@ -146,15 +195,40 @@ pub async fn get(
     range: Option<(u64, u64)>,
     if_range: Option<&str>,
 ) -> anyhow::Result<Fetched> {
+    request_with_method(client, Method::GET, url, range, if_range).await
+}
+
+pub async fn head(client: &HttpClient, url: &str) -> anyhow::Result<Fetched> {
+    request_with_method(client, Method::HEAD, url, None, None).await
+}
+
+async fn request_with_method(
+    client: &HttpClient,
+    method: Method,
+    url: &str,
+    range: Option<(u64, u64)>,
+    if_range: Option<&str>,
+) -> anyhow::Result<Fetched> {
     let mut cur = url.to_string();
-    for _ in 0..8 {
+    let origin_referer = url::Url::parse(url)
+        .ok()
+        .and_then(|mut u| {
+            u.set_path("/");
+            u.set_query(None);
+            u.set_fragment(None);
+            Some(u.to_string())
+        });
+    for _ in 0..10 {
         let uri: Uri = cur.parse()?;
         let mut rb = Request::builder()
-            .method(Method::GET)
+            .method(method.clone())
             .uri(uri)
             .header(header::USER_AGENT, UA)
             .header(header::ACCEPT, "*/*")
             .header(header::ACCEPT_ENCODING, "identity");
+        if let Some(ref referer) = origin_referer {
+            rb = rb.header(header::REFERER, referer.as_str());
+        }
         if let Some((s, e)) = range {
             rb = rb.header(header::RANGE, format!("bytes={s}-{e}"));
             if let Some(v) = if_range {
